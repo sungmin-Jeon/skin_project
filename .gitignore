@@ -1,0 +1,31 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+
+data/
+datasets/
+checkpoints/
+outputs/
+runs/
+
+*.jpg
+*.jpeg
+*.png
+*.zip
+*.tar
+*.gz
+*.7z
+*.pt
+*.pth
+*.ckpt
+
+.ipynb_checkpoints/
+
+# Local training data and generated ROI crops
+manifests/
+skin_cache/
+
+# Editor / tooling
+.pytest_cache/
+.ruff_cache/

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skin-project"
+version = "0.1.0"
+description = "Multi-view regional skin assessment baselines"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.0",
+  "Pillow>=10.0",
+  "scikit-learn>=1.3",
+  "torch>=2.2",
+  "torchvision>=0.17",
+  "tqdm>=4.66",
+]
+
+[project.scripts]
+skin-train = "skin_project.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
