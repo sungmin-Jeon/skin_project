@@ -66,6 +66,7 @@ skin-train \
 ```bash
 skin-train \
   --task core_15 \
+  --run-name core_15_balanced \
   --subject-manifest /path/to/subject_manifest_with_split.csv \
   --region-manifest /path/to/region_manifest.csv \
   --data-root /path/to/skin_data \
@@ -86,6 +87,12 @@ skin-train \
 - 각 target의 Huber loss를 계산한 뒤 target 간 평균을 total loss로 사용한다.
 - 수분값은 train split의 평균과 표준편차로 표준화한 뒤 loss를 계산한다.
 - grade와 수분 target에 동일한 가중치를 주므로 라벨 수가 많은 부위가 loss를 독점하지 않는다.
+- grade target은 train split의 등급 빈도에 반비례하는 완만한 가중치를 사용한다.
+  기본값은 제곱근 역빈도(`--grade-balance-power 0.5`)이며, 희귀 샘플의
+  최대 가중치는 3배(`--max-grade-weight 3`)로 제한한다. 기존 loss로 비교하려면
+  `--grade-balance-power 0`을 사용한다.
+- validation loss에도 같은 등급 가중치를 적용하여 희귀 등급을 더 잘 맞히는 checkpoint를
+  선택한다. test의 라벨별 MAE, 정확도, QWK 계산 방식은 기존과 동일하다.
 
 `grades_11`과 `core_15`는 한 사람당 8개 부위 × 3개 뷰를 사용하므로 GPU 메모리가
 부족하면 `--batch-size 2`로 낮춘다. CUDA가 없는 CPU에서도 실행은 가능하지만 매우 느리다.

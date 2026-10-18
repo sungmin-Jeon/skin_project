@@ -10,11 +10,12 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import cohen_kappa_score
+from sklearn.metrics import balanced_accuracy_score, cohen_kappa_score
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from .data import MultiRegionDataset, load_manifests, prepare_crop_cache
+from .losses import GradeFrequencyWeights
 from .model import MultiRegionMultiViewModel
 from .tasks import TargetSpec, get_task_specs, required_regions
 
@@ -33,6 +34,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
+    parser.add_argument(
+        "--run-name",
+        help="Output subdirectory name; defaults to the task name.",
+    )
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -41,6 +46,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=4)
     parser.add_argument("--margin-ratio", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--grade-balance-power",
+        type=float,
+        default=0.5,
+        help="Inverse-frequency strength for grade loss; use 0 to disable.",
+    )
+    parser.add_argument(
+        "--max-grade-weight",
+        type=float,
+        default=3.0,
+        help="Maximum per-example grade loss weight.",
+    )
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--overwrite-cache", action="store_true")
     parser.add_argument("--cache-only", action="store_true")
@@ -152,6 +169,7 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
     scaler: torch.amp.GradScaler,
+    grade_weights: GradeFrequencyWeights | None = None,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     training = optimizer is not None
     model.train(training)
@@ -173,9 +191,17 @@ def run_epoch(
                 device_type=device.type, dtype=torch.float16, enabled=use_amp
             ):
                 predictions = model(images, view_mask)
-                per_target_loss = F.huber_loss(
+                element_loss = F.huber_loss(
                     predictions, normalized_targets, delta=1.0, reduction="none"
-                ).mean(dim=0)
+                )
+                if grade_weights is None:
+                    per_target_loss = element_loss.mean(dim=0)
+                else:
+                    sample_weights = grade_weights.for_targets(targets)
+                    per_target_loss = (
+                        (element_loss * sample_weights).sum(dim=0)
+                        / sample_weights.sum(dim=0).clamp_min(1e-8)
+                    )
                 loss = per_target_loss.mean()
             if training:
                 scaler.scale(loss).backward()
@@ -200,6 +226,10 @@ def target_metrics(
 ) -> tuple[list[dict[str, object]], dict[str, float]]:
     rows: list[dict[str, object]] = []
     grade_maes: list[float] = []
+    grade_exact_accuracies: list[float] = []
+    grade_balanced_accuracies: list[float] = []
+    grade_within_one: list[float] = []
+    grade_qwks: list[float] = []
     continuous_nmaes: list[float] = []
     for index, spec in enumerate(specs):
         truth = targets[:, index]
@@ -217,6 +247,9 @@ def target_metrics(
             truth_grade = np.rint(truth).astype(int)
             predicted_grade = np.rint(predicted).astype(int)
             row["exact_accuracy"] = float(np.mean(truth_grade == predicted_grade))
+            row["balanced_accuracy"] = float(
+                balanced_accuracy_score(truth_grade, predicted_grade)
+            )
             row["within_one_grade"] = float(
                 np.mean(np.abs(truth_grade - predicted_grade) <= 1)
             )
@@ -224,6 +257,10 @@ def target_metrics(
                 cohen_kappa_score(truth_grade, predicted_grade, weights="quadratic")
             )
             grade_maes.append(mae)
+            grade_exact_accuracies.append(float(row["exact_accuracy"]))
+            grade_balanced_accuracies.append(float(row["balanced_accuracy"]))
+            grade_within_one.append(float(row["within_one_grade"]))
+            grade_qwks.append(float(row["qwk"]))
         else:
             scale = float(np.std(truth))
             row["normalized_mae"] = mae / scale if scale > 1e-8 else np.nan
@@ -233,6 +270,14 @@ def target_metrics(
     summary: dict[str, float] = {}
     if grade_maes:
         summary["grade_macro_mae"] = float(np.mean(grade_maes))
+        summary["grade_macro_exact_accuracy"] = float(
+            np.mean(grade_exact_accuracies)
+        )
+        summary["grade_macro_balanced_accuracy"] = float(
+            np.mean(grade_balanced_accuracies)
+        )
+        summary["grade_macro_within_one"] = float(np.mean(grade_within_one))
+        summary["grade_macro_qwk"] = float(np.mean(grade_qwks))
     if continuous_nmaes:
         summary["continuous_macro_normalized_mae"] = float(
             np.nanmean(continuous_nmaes)
@@ -285,6 +330,17 @@ def main() -> None:
     )
     train_df = subjects[subjects["split"] == "train"]
     normalizer = TargetNormalizer(specs, train_df)
+    grade_weights = GradeFrequencyWeights(
+        specs,
+        train_df,
+        power=args.grade_balance_power,
+        max_weight=args.max_grade_weight,
+    )
+    print(
+        "Grade balancing: "
+        f"power={args.grade_balance_power:g}, "
+        f"max_weight={args.max_grade_weight:g}"
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
@@ -303,7 +359,7 @@ def main() -> None:
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
-    run_dir = args.output_dir / args.task
+    run_dir = args.output_dir / (args.run_name or args.task)
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = run_dir / "best.pt"
     history: list[dict[str, float | int]] = []
@@ -312,10 +368,22 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_targets, train_predictions = run_epoch(
-            model, loaders["train"], normalizer, device, optimizer, scaler
+            model,
+            loaders["train"],
+            normalizer,
+            device,
+            optimizer,
+            scaler,
+            grade_weights,
         )
         val_loss, val_targets, val_predictions = run_epoch(
-            model, loaders["val"], normalizer, device, None, scaler
+            model,
+            loaders["val"],
+            normalizer,
+            device,
+            None,
+            scaler,
+            grade_weights,
         )
         _, train_summary = target_metrics(specs, train_targets, train_predictions)
         _, val_summary = target_metrics(specs, val_targets, val_predictions)
@@ -347,6 +415,7 @@ def main() -> None:
                     "regions": regions,
                     "target_specs": [asdict(spec) for spec in specs],
                     "normalizer": normalizer.state_dict(),
+                    "grade_weights": grade_weights.state_dict(),
                     "epoch": epoch,
                     "best_val_loss": best_val_loss,
                 },
