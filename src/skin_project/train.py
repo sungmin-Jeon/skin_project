@@ -114,6 +114,7 @@ def create_loaders(
     cache_dir: Path,
     regions: tuple[str, ...],
     specs: tuple[TargetSpec, ...],
+    available_crops: set[tuple[str, str, str, str]],
     batch_size: int,
     num_workers: int,
 ) -> dict[str, DataLoader]:
@@ -128,6 +129,7 @@ def create_loaders(
             cache_root=cache_dir,
             regions=regions,
             target_specs=specs,
+            available_crops=available_crops,
             transform=train_transform if split == "train" else eval_transform,
         )
         loader_options = {
@@ -160,6 +162,7 @@ def run_epoch(
 
     for batch in loader:
         images = batch["images"].to(device, non_blocking=True)
+        view_mask = batch["view_mask"].to(device, non_blocking=True)
         targets = batch["targets"].to(device, non_blocking=True)
         normalized_targets = normalizer.normalize_tensor(targets)
         if training:
@@ -169,7 +172,7 @@ def run_epoch(
             with torch.autocast(
                 device_type=device.type, dtype=torch.float16, enabled=use_amp
             ):
-                predictions = model(images)
+                predictions = model(images, view_mask)
                 per_target_loss = F.huber_loss(
                     predictions, normalized_targets, delta=1.0, reduction="none"
                 ).mean(dim=0)
@@ -257,7 +260,7 @@ def main() -> None:
     print(f"Targets: {len(specs)} | Regions: {len(regions)} {regions}")
     print("Split counts:")
     print(subjects["split"].value_counts().to_string())
-    prepare_crop_cache(
+    available_crops = prepare_crop_cache(
         subjects,
         region_manifest,
         data_root=args.data_root,
@@ -272,7 +275,13 @@ def main() -> None:
 
     batch_size = args.batch_size or (16 if args.task == "forehead_1" else 4)
     loaders = create_loaders(
-        subjects, args.cache_dir, regions, specs, batch_size, args.num_workers
+        subjects,
+        args.cache_dir,
+        regions,
+        specs,
+        available_crops,
+        batch_size,
+        args.num_workers,
     )
     train_df = subjects[subjects["split"] == "train"]
     normalizer = TargetNormalizer(specs, train_df)

@@ -43,7 +43,11 @@ class MultiRegionMultiViewModel(nn.Module):
                 nn.Linear(256, output_count),
             )
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        images: torch.Tensor,
+        view_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # [batch, region, view, channel, height, width]
         batch, region_count, view_count, channels, height, width = images.shape
         flattened = images.reshape(
@@ -51,7 +55,12 @@ class MultiRegionMultiViewModel(nn.Module):
         )
         features = self.encoder(flattened)
         features = features.reshape(batch, region_count, view_count, -1)
-        fused = features.mean(dim=2)
+        if view_mask is None:
+            fused = features.mean(dim=2)
+        else:
+            weights = view_mask.to(dtype=features.dtype).unsqueeze(-1)
+            denominator = weights.sum(dim=2).clamp_min(1.0)
+            fused = (features * weights).sum(dim=2) / denominator
 
         columns: list[torch.Tensor | None] = [None] * len(self.target_specs)
         for region_index, region in enumerate(self.regions):

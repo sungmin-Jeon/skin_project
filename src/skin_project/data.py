@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 from typing import Iterable
 
@@ -10,10 +9,12 @@ from PIL import Image, ImageOps
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
+from .bbox import has_bbox, parse_bbox
 from .tasks import FACEPART_TO_REGION, TargetSpec
 
 
 VIEWS = ("F", "L", "R")
+CropKey = tuple[str, str, str, str]
 
 
 def load_manifests(
@@ -54,15 +55,6 @@ def load_manifests(
     return subjects, regions
 
 
-def parse_bbox(value: object) -> tuple[int, int, int, int]:
-    if isinstance(value, str):
-        value = ast.literal_eval(value)
-    if not isinstance(value, (list, tuple)) or len(value) != 4:
-        raise ValueError(f"Invalid bbox: {value!r}")
-    x1, y1, x2, y2 = (int(round(float(number))) for number in value)
-    return x1, y1, x2, y2
-
-
 def crop_with_margin(
     image: Image.Image,
     bbox: object,
@@ -99,7 +91,7 @@ def prepare_crop_cache(
     required_regions: Iterable[str],
     margin_ratio: float = 0.10,
     overwrite: bool = False,
-) -> None:
+) -> set[CropKey]:
     data_root = Path(data_root)
     cache_root = Path(cache_root)
     required_regions = tuple(required_regions)
@@ -111,6 +103,7 @@ def prepare_crop_cache(
         example = selected.loc[duplicates, key_columns].head().to_dict("records")
         raise ValueError(f"Duplicate region rows found: {example}")
     bbox_lookup = selected.set_index(key_columns)["bbox"].to_dict()
+    available_crops: set[CropKey] = set()
 
     expected = len(subjects) * len(required_regions) * len(VIEWS)
     progress = tqdm(total=expected, desc="Caching ROI crops")
@@ -130,6 +123,10 @@ def prepare_crop_cache(
                 key = (source_split, subject_id, view, region)
                 if key not in bbox_lookup:
                     raise KeyError(f"Missing bbox for {key}")
+                if not has_bbox(bbox_lookup[key]):
+                    progress.update(1)
+                    continue
+                available_crops.add(key)
                 if overwrite or not output_path.is_file():
                     pending.append((region, output_path, bbox_lookup[key]))
                 else:
@@ -146,6 +143,7 @@ def prepare_crop_cache(
                     crop.save(output_path, "JPEG", quality=95, subsampling=0)
                     progress.update(1)
     progress.close()
+    return available_crops
 
 
 class MultiRegionDataset(Dataset):
@@ -155,12 +153,14 @@ class MultiRegionDataset(Dataset):
         cache_root: str | Path,
         regions: tuple[str, ...],
         target_specs: tuple[TargetSpec, ...],
+        available_crops: set[CropKey],
         transform,
     ) -> None:
         self.dataframe = dataframe.reset_index(drop=True).copy()
         self.cache_root = Path(cache_root)
         self.regions = regions
         self.target_specs = target_specs
+        self.available_crops = available_crops
         self.transform = transform
 
     def __len__(self) -> int:
@@ -169,20 +169,42 @@ class MultiRegionDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, object]:
         row = self.dataframe.iloc[index]
         region_tensors: list[torch.Tensor] = []
+        region_view_masks: list[torch.Tensor] = []
         for region in self.regions:
+            source_split = str(row["source_split"])
+            subject_id = str(row["subject_id"]).zfill(4)
+            available_views = [
+                view
+                for view in VIEWS
+                if (source_split, subject_id, view, region) in self.available_crops
+            ]
+            if not available_views:
+                raise RuntimeError(
+                    f"No usable view for subject={subject_id}, region={region}"
+                )
+
+            # A missing view is filled with the first valid crop so the shared
+            # encoder sees a natural image. The mask removes the duplicate from
+            # view fusion, so it contributes no feature weight.
+            fallback_view = available_views[0]
             view_tensors: list[torch.Tensor] = []
+            view_mask: list[float] = []
             for view in VIEWS:
+                is_available = view in available_views
+                load_view = view if is_available else fallback_view
                 path = cache_path_for(
                     self.cache_root,
-                    str(row["source_split"]),
-                    str(row["subject_id"]).zfill(4),
+                    source_split,
+                    subject_id,
                     region,
-                    view,
+                    load_view,
                 )
                 with Image.open(path) as source:
                     image = source.convert("RGB")
                 view_tensors.append(self.transform(image))
+                view_mask.append(float(is_available))
             region_tensors.append(torch.stack(view_tensors, dim=0))
+            region_view_masks.append(torch.tensor(view_mask, dtype=torch.float32))
 
         targets = torch.tensor(
             [float(row[spec.column]) for spec in self.target_specs],
@@ -190,6 +212,7 @@ class MultiRegionDataset(Dataset):
         )
         return {
             "images": torch.stack(region_tensors, dim=0),
+            "view_mask": torch.stack(region_view_masks, dim=0),
             "targets": targets,
             "subject_id": str(row["subject_id"]),
         }

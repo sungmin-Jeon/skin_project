@@ -81,6 +81,7 @@ skin-train \
 
 - 입력 shape: `[batch, region, view=3, RGB, 224, 224]`
 - F/L/R은 동일한 EfficientNet-B0로 인코딩하고 특징을 평균한다.
+- 측면에서 보이지 않아 bbox가 없는 부위는 view mask로 제외하고, 존재하는 뷰만 평균한다.
 - 공유 인코더 뒤에 부위별 head를 둔다.
 - 각 target의 Huber loss를 계산한 뒤 target 간 평균을 total loss로 사용한다.
 - 수분값은 train split의 평균과 표준편차로 표준화한 뒤 loss를 계산한다.
