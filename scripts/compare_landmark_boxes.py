@@ -10,6 +10,7 @@ from PIL import Image
 
 from skin_project.bbox import has_bbox, parse_bbox
 from skin_project.tasks import FACEPART_TO_REGION
+from skin_project.views import VIEW_POLICIES, views_for_region
 
 
 KEYS = ["source_split", "subject_id", "view", "facepart"]
@@ -27,6 +28,30 @@ def intersection_over_union(first: object, second: object) -> float:
     second_area = max(0, bx2 - bx1) * max(0, by2 - by1)
     union = first_area + second_area - intersection
     return intersection / union if union else float("nan")
+
+
+def ground_truth_coverage(ground_truth: object, landmark: object) -> float:
+    """Fraction of the dataset box covered by the landmark-generated crop."""
+    if not has_bbox(ground_truth) or not has_bbox(landmark):
+        return float("nan")
+    gx1, gy1, gx2, gy2 = parse_bbox(ground_truth)
+    lx1, ly1, lx2, ly2 = parse_bbox(landmark)
+    intersection_width = max(0, min(gx2, lx2) - max(gx1, lx1))
+    intersection_height = max(0, min(gy2, ly2) - max(gy1, ly1))
+    ground_truth_area = max(0, gx2 - gx1) * max(0, gy2 - gy1)
+    if ground_truth_area == 0:
+        return float("nan")
+    return intersection_width * intersection_height / ground_truth_area
+
+
+def ground_truth_center_hit(ground_truth: object, landmark: object) -> float:
+    if not has_bbox(ground_truth) or not has_bbox(landmark):
+        return float("nan")
+    gx1, gy1, gx2, gy2 = parse_bbox(ground_truth)
+    lx1, ly1, lx2, ly2 = parse_bbox(landmark)
+    center_x = (gx1 + gx2) / 2
+    center_y = (gy1 + gy2) / 2
+    return float(lx1 <= center_x <= lx2 and ly1 <= center_y <= ly2)
 
 
 def load_comparison(ground_truth_path: Path, landmark_path: Path) -> pd.DataFrame:
@@ -50,7 +75,27 @@ def load_comparison(ground_truth_path: Path, landmark_path: Path) -> pd.DataFram
             merged["bbox_ground_truth"], merged["bbox_landmark"]
         )
     ]
+    merged["ground_truth_coverage"] = [
+        ground_truth_coverage(first, second)
+        for first, second in zip(
+            merged["bbox_ground_truth"], merged["bbox_landmark"]
+        )
+    ]
+    merged["ground_truth_center_hit"] = [
+        ground_truth_center_hit(first, second)
+        for first, second in zip(
+            merged["bbox_ground_truth"], merged["bbox_landmark"]
+        )
+    ]
     return merged
+
+
+def filter_view_policy(frame: pd.DataFrame, policy: str) -> pd.DataFrame:
+    keep = [
+        row.view in views_for_region(policy, row.region)
+        for row in frame.itertuples(index=False)
+    ]
+    return frame.loc[keep].reset_index(drop=True)
 
 
 def add_image_paths(frame: pd.DataFrame, subject_manifest: Path) -> pd.DataFrame:
@@ -77,7 +122,17 @@ def draw_worst_cases(
     output: Path,
     count: int,
 ) -> None:
-    examples = frame.dropna(subset=["iou", "image_path"]).nsmallest(count, "iou")
+    examples = frame.dropna(
+        subset=[
+            "iou",
+            "ground_truth_coverage",
+            "ground_truth_center_hit",
+            "image_path",
+        ]
+    ).nsmallest(
+        count,
+        ["ground_truth_center_hit", "ground_truth_coverage", "iou"],
+    )
     columns = 4
     rows = max(1, (len(examples) + columns - 1) // columns)
     figure, axes = plt.subplots(rows, columns, figsize=(4.5 * columns, 5 * rows))
@@ -103,7 +158,9 @@ def draw_worst_cases(
                 )
             )
         axis.set_title(
-            f"{row['subject_id']} {row['view']} {row['region']}\nIoU={row['iou']:.3f}"
+            f"{row['subject_id']} {row['view']} {row['region']}\n"
+            f"IoU={row['iou']:.3f}, GT coverage="
+            f"{row['ground_truth_coverage']:.3f}"
         )
         axis.axis("off")
     for axis in axes[len(examples):]:
@@ -125,6 +182,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--worst-count", type=int, default=12)
+    parser.add_argument(
+        "--view-policy",
+        choices=tuple(VIEW_POLICIES),
+        default="service",
+        help="Only evaluate region/view pairs used by this policy.",
+    )
     return parser.parse_args()
 
 
@@ -134,25 +197,41 @@ def main() -> None:
     comparison = load_comparison(
         args.ground_truth_manifest, args.landmark_manifest
     )
+    comparison = filter_view_policy(comparison, args.view_policy)
     comparison = add_image_paths(comparison, args.subject_manifest)
     summary = (
-        comparison.groupby("region")["iou"]
-        .agg(["count", "mean", "median", "min", "max"])
-        .sort_values("mean")
+        comparison.groupby("region")
+        .agg(
+            count=("iou", "count"),
+            mean_iou=("iou", "mean"),
+            median_iou=("iou", "median"),
+            mean_ground_truth_coverage=("ground_truth_coverage", "mean"),
+            center_hit_rate=("ground_truth_center_hit", "mean"),
+        )
+        .sort_values("mean_ground_truth_coverage")
     )
     comparison.to_csv(args.output_dir / "landmark_iou_rows.csv", index=False)
     summary.to_csv(args.output_dir / "landmark_iou_summary.csv")
 
-    figure, axis = plt.subplots(figsize=(11, 5))
-    comparison.boxplot(column="iou", by="region", ax=axis, grid=False)
-    axis.set_title("Landmark bbox IoU by region")
-    axis.set_xlabel("")
-    axis.set_ylabel("IoU")
-    axis.tick_params(axis="x", rotation=30)
+    figure, axes = plt.subplots(1, 2, figsize=(15, 5))
+    comparison.boxplot(column="iou", by="region", ax=axes[0], grid=False)
+    comparison.boxplot(
+        column="ground_truth_coverage",
+        by="region",
+        ax=axes[1],
+        grid=False,
+    )
+    axes[0].set_title("IoU by region")
+    axes[0].set_ylabel("IoU")
+    axes[1].set_title("Dataset-box coverage by landmark crop")
+    axes[1].set_ylabel("Coverage")
+    for axis in axes:
+        axis.set_xlabel("")
+        axis.tick_params(axis="x", rotation=30)
     figure.suptitle("")
     figure.tight_layout()
     figure.savefig(
-        args.output_dir / "landmark_iou_boxplot.png",
+        args.output_dir / "landmark_box_metrics.png",
         dpi=220,
         bbox_inches="tight",
     )

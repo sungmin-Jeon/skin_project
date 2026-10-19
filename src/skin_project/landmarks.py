@@ -27,7 +27,10 @@ REGION_LANDMARKS: dict[str, tuple[int, ...]] = {
         54, 103, 67, 109, 10, 338, 297, 332, 284,
         70, 63, 105, 66, 107, 336, 296, 334, 293, 300,
     ),
-    "glabella": (107, 66, 105, 168, 6, 197, 336, 296, 334),
+    # Inner ends of both eyebrows (107, 336) and the upper nose bridge
+    # (168, 6). Do not include the remaining eyebrow points: doing so turns
+    # the glabella crop into a wide, both-eyebrows crop.
+    "glabella": (107, 168, 6, 336),
     "right_eye": (
         33, 7, 163, 144, 145, 153, 154, 155, 133,
         246, 161, 160, 159, 158, 157, 173,
@@ -60,7 +63,7 @@ REGION_LANDMARKS: dict[str, tuple[int, ...]] = {
 
 REGION_PADDING = {
     "forehead": (0.08, 0.30),
-    "glabella": (0.30, 0.25),
+    "glabella": (0.08, 0.12),
     "right_eye": (0.20, 0.35),
     "left_eye": (0.20, 0.35),
     "right_cheek": (0.15, 0.15),

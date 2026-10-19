@@ -64,6 +64,7 @@ MediaPipe 구버전의 `solutions.face_mesh`가 설치된 환경에서는 모델
 서비스 추론 코드에서는 `skin_project.landmarks.crop_regions_from_landmarks`를
 그대로 호출한다. 이 함수는 위 manifest 생성과 같은 랜드마크 규칙 및 학습 crop의
 기본 여백 10%를 사용하므로, 별도의 서비스 bbox 규칙을 다시 만들지 않는다.
+미간은 양쪽 눈썹의 안쪽 끝과 코뿌리만 사용하며, 눈썹 전체를 포함하지 않는다.
 
 생성 직후에는 랜드마크 규칙을 고정하기 전에 정답 bbox와 IoU 및 최악 사례를 확인한다.
 
@@ -73,10 +74,14 @@ python scripts/compare_landmark_boxes.py \
   --landmark-manifest /path/to/landmark_region_manifest.csv \
   --subject-manifest /path/to/subject_manifest_with_split.csv \
   --data-root /path/to/skin_data \
-  --output-dir /path/to/landmark_qc
+  --output-dir /path/to/landmark_qc \
+  --view-policy service
 ```
 
-`landmark_iou_summary.csv`, 부위별 IoU boxplot, 최저 IoU overlay 이미지가 생성된다.
+`landmark_iou_summary.csv`, 부위별 IoU/coverage boxplot, 취약 사례 overlay 이미지가 생성된다.
+정답 bbox가 작은 측정 지점인 경우 IoU보다 `mean_ground_truth_coverage`와
+`center_hit_rate`를 우선 확인한다. 기본 QC는 실제 서비스에서 사용하는 부위-view
+조합만 평가한다.
 랜드마크 ROI가 육안으로 부적절하면 `REGION_LANDMARKS`와 `REGION_PADDING`을 수정한 뒤
 manifest와 landmark crop cache를 다시 만든다.
 

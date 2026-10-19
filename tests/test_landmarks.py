@@ -3,6 +3,7 @@ import unittest
 from PIL import Image
 
 from skin_project.landmarks import (
+    REGION_LANDMARKS,
     boxes_from_landmarks,
     crop_regions_from_landmarks,
 )
@@ -23,6 +24,9 @@ class FakeDetector:
 
 
 class LandmarkBoxTest(unittest.TestCase):
+    def test_glabella_uses_only_inner_brow_and_nose_bridge(self):
+        self.assertEqual(REGION_LANDMARKS["glabella"], (107, 168, 6, 336))
+
     def test_boxes_are_inside_image(self):
         landmarks = [FakeLandmark((index % 20) / 20, (index % 25) / 25) for index in range(478)]
         boxes = boxes_from_landmarks(landmarks, width=200, height=100)
