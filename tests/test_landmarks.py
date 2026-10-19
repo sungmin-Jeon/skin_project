@@ -27,6 +27,18 @@ class LandmarkBoxTest(unittest.TestCase):
     def test_glabella_uses_only_inner_brow_and_nose_bridge(self):
         self.assertEqual(REGION_LANDMARKS["glabella"], (107, 168, 6, 336))
 
+    def test_glabella_box_is_centered_above_inner_brows(self):
+        landmarks = [FakeLandmark(0.5, 0.5) for _ in range(478)]
+        landmarks[107] = FakeLandmark(0.4, 0.5)
+        landmarks[336] = FakeLandmark(0.6, 0.5)
+        box = boxes_from_landmarks(landmarks, width=200, height=100)[
+            "glabella"
+        ]
+        x1, y1, x2, y2 = box
+        self.assertAlmostEqual((x1 + x2) / 2, 100, delta=1)
+        self.assertLess((y1 + y2) / 2, 50)
+        self.assertLess(x2 - x1, 40)
+
     def test_boxes_are_inside_image(self):
         landmarks = [FakeLandmark((index % 20) / 20, (index % 25) / 25) for index in range(478)]
         boxes = boxes_from_landmarks(landmarks, width=200, height=100)

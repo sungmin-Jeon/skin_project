@@ -145,9 +145,31 @@ def boxes_from_landmarks(
     )
     boxes: dict[str, tuple[int, int, int, int]] = {}
     for region, indices in REGION_LANDMARKS.items():
-        selected = points[list(indices)]
-        x1, y1 = selected.min(axis=0)
-        x2, y2 = selected.max(axis=0)
+        if region == "glabella":
+            # The label describes the vertical frown-line area above the nose
+            # bridge, not the whole span of both eyebrows. Use the inner-brow
+            # distance as scale and move the box upward so the eye/privacy-mask
+            # area does not dominate the crop.
+            first_inner_brow = points[107]
+            second_inner_brow = points[336]
+            brow_scale = max(
+                float(np.linalg.norm(first_inner_brow - second_inner_brow)),
+                2.0,
+            )
+            center_x = float(
+                (first_inner_brow[0] + second_inner_brow[0]) / 2
+            )
+            brow_y = float(
+                (first_inner_brow[1] + second_inner_brow[1]) / 2
+            )
+            x1 = center_x - 0.30 * brow_scale
+            x2 = center_x + 0.30 * brow_scale
+            y1 = brow_y - 0.70 * brow_scale
+            y2 = brow_y + 0.30 * brow_scale
+        else:
+            selected = points[list(indices)]
+            x1, y1 = selected.min(axis=0)
+            x2, y2 = selected.max(axis=0)
         pad_x_ratio, pad_y_ratio = REGION_PADDING[region]
         pad_x = max((x2 - x1) * pad_x_ratio, 2.0)
         pad_y = max((y2 - y1) * pad_y_ratio, 2.0)
