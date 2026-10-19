@@ -11,9 +11,9 @@ from tqdm.auto import tqdm
 
 from .bbox import has_bbox, parse_bbox
 from .tasks import FACEPART_TO_REGION, TargetSpec
+from .views import VIEWS, views_for_region
 
 
-VIEWS = ("F", "L", "R")
 CropKey = tuple[str, str, str, str]
 
 
@@ -91,6 +91,7 @@ def prepare_crop_cache(
     required_regions: Iterable[str],
     margin_ratio: float = 0.10,
     overwrite: bool = False,
+    view_policy: str = "all",
 ) -> set[CropKey]:
     data_root = Path(data_root)
     cache_root = Path(cache_root)
@@ -105,7 +106,10 @@ def prepare_crop_cache(
     bbox_lookup = selected.set_index(key_columns)["bbox"].to_dict()
     available_crops: set[CropKey] = set()
 
-    expected = len(subjects) * len(required_regions) * len(VIEWS)
+    expected_per_subject = sum(
+        len(views_for_region(view_policy, region)) for region in required_regions
+    )
+    expected = len(subjects) * expected_per_subject
     progress = tqdm(total=expected, desc="Caching ROI crops")
     for row in subjects.itertuples(index=False):
         source_split = str(row.source_split)
@@ -117,6 +121,8 @@ def prepare_crop_cache(
 
             pending: list[tuple[str, Path, object]] = []
             for region in required_regions:
+                if view not in views_for_region(view_policy, region):
+                    continue
                 output_path = cache_path_for(
                     cache_root, source_split, subject_id, region, view
                 )
@@ -155,6 +161,7 @@ class MultiRegionDataset(Dataset):
         target_specs: tuple[TargetSpec, ...],
         available_crops: set[CropKey],
         transform,
+        view_policy: str = "all",
     ) -> None:
         self.dataframe = dataframe.reset_index(drop=True).copy()
         self.cache_root = Path(cache_root)
@@ -162,6 +169,7 @@ class MultiRegionDataset(Dataset):
         self.target_specs = target_specs
         self.available_crops = available_crops
         self.transform = transform
+        self.view_policy = view_policy
 
     def __len__(self) -> int:
         return len(self.dataframe)
@@ -173,9 +181,10 @@ class MultiRegionDataset(Dataset):
         for region in self.regions:
             source_split = str(row["source_split"])
             subject_id = str(row["subject_id"]).zfill(4)
+            allowed_views = views_for_region(self.view_policy, region)
             available_views = [
                 view
-                for view in VIEWS
+                for view in allowed_views
                 if (source_split, subject_id, view, region) in self.available_crops
             ]
             if not available_views:
@@ -190,7 +199,7 @@ class MultiRegionDataset(Dataset):
             view_tensors: list[torch.Tensor] = []
             view_mask: list[float] = []
             for view in VIEWS:
-                is_available = view in available_views
+                is_available = view in allowed_views and view in available_views
                 load_view = view if is_available else fallback_view
                 path = cache_path_for(
                     self.cache_root,

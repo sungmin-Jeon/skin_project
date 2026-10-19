@@ -1,0 +1,58 @@
+import unittest
+
+from PIL import Image
+
+from skin_project.landmarks import (
+    boxes_from_landmarks,
+    crop_regions_from_landmarks,
+)
+
+
+class FakeLandmark:
+    def __init__(self, x: float, y: float):
+        self.x = x
+        self.y = y
+
+
+class FakeDetector:
+    def __init__(self, landmarks):
+        self.landmarks = landmarks
+
+    def detect(self, image):
+        return self.landmarks
+
+
+class LandmarkBoxTest(unittest.TestCase):
+    def test_boxes_are_inside_image(self):
+        landmarks = [FakeLandmark((index % 20) / 20, (index % 25) / 25) for index in range(478)]
+        boxes = boxes_from_landmarks(landmarks, width=200, height=100)
+        self.assertEqual(len(boxes), 8)
+        for box in boxes.values():
+            x1, y1, x2, y2 = box
+            self.assertGreaterEqual(x1, 0)
+            self.assertGreaterEqual(y1, 0)
+            self.assertLessEqual(x2, 200)
+            self.assertLessEqual(y2, 100)
+            self.assertGreater(x2, x1)
+            self.assertGreater(y2, y1)
+
+    def test_service_crops_use_landmark_boxes(self):
+        landmarks = [
+            FakeLandmark((index % 20) / 20, (index % 25) / 25)
+            for index in range(478)
+        ]
+        image = Image.new("RGB", (200, 100), "white")
+        crops = crop_regions_from_landmarks(
+            image,
+            FakeDetector(landmarks),
+            regions=("forehead", "lips"),
+        )
+        self.assertEqual(set(crops), {"forehead", "lips"})
+        for crop in crops.values():
+            self.assertGreater(crop.width, 0)
+            self.assertGreater(crop.height, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+

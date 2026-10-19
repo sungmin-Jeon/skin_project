@@ -3,7 +3,7 @@ import unittest
 import pandas as pd
 import torch
 
-from skin_project.losses import GradeFrequencyWeights
+from skin_project.losses import ClassificationWeights, GradeFrequencyWeights
 from skin_project.tasks import TargetSpec
 
 
@@ -43,6 +43,23 @@ class GradeFrequencyWeightsTest(unittest.TestCase):
             GradeFrequencyWeights(
                 self.specs, self.train_df, max_weight=0.5
             )
+
+    def test_class_balancing_upweights_rare_grade(self):
+        weighter = ClassificationWeights(
+            self.specs,
+            self.train_df,
+            beta=0.999,
+        )
+        weights = weighter.class_weights("grade", torch.device("cpu"))
+        self.assertGreater(weights[1].item(), weights[0].item())
+        self.assertEqual(len(weights), 3)
+
+    def test_ordinal_weights_have_one_value_per_threshold(self):
+        weighter = ClassificationWeights(self.specs, self.train_df)
+        weights = weighter.ordinal_positive_weights(
+            "grade", torch.device("cpu")
+        )
+        self.assertEqual(len(weights), 2)
 
 
 if __name__ == "__main__":

@@ -15,9 +15,10 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from .data import MultiRegionDataset, load_manifests, prepare_crop_cache
-from .losses import GradeFrequencyWeights
-from .model import MultiRegionMultiViewModel
+from .losses import ClassificationWeights, GradeFrequencyWeights
+from .model import ConfigurableSkinModel
 from .tasks import TargetSpec, get_task_specs, required_regions
+from .views import VIEW_POLICIES
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +42,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--grade-objective",
+        choices=("regression", "softmax", "ordinal"),
+        default="regression",
+    )
+    parser.add_argument(
+        "--fusion",
+        choices=("mean", "concat", "attention"),
+        default="mean",
+    )
+    parser.add_argument(
+        "--view-policy",
+        choices=tuple(VIEW_POLICIES),
+        default="all",
+    )
+    parser.add_argument(
+        "--selection-metric",
+        choices=("loss", "grade_qwk", "balanced_accuracy"),
+        default="loss",
+        help="Validation metric used for checkpoint selection and early stopping.",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=4)
@@ -57,6 +79,17 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=3.0,
         help="Maximum per-example grade loss weight.",
+    )
+    parser.add_argument(
+        "--class-balance-beta",
+        type=float,
+        default=0.999,
+        help="Effective-number beta for softmax class balancing.",
+    )
+    parser.add_argument(
+        "--max-class-weight",
+        type=float,
+        default=5.0,
     )
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--overwrite-cache", action="store_true")
@@ -134,6 +167,7 @@ def create_loaders(
     available_crops: set[tuple[str, str, str, str]],
     batch_size: int,
     num_workers: int,
+    view_policy: str,
 ) -> dict[str, DataLoader]:
     train_transform, eval_transform = build_transforms()
     loaders: dict[str, DataLoader] = {}
@@ -148,6 +182,7 @@ def create_loaders(
             target_specs=specs,
             available_crops=available_crops,
             transform=train_transform if split == "train" else eval_transform,
+            view_policy=view_policy,
         )
         loader_options = {
             "batch_size": batch_size,
@@ -169,7 +204,10 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
     scaler: torch.amp.GradScaler,
+    specs: tuple[TargetSpec, ...],
+    grade_objective: str,
     grade_weights: GradeFrequencyWeights | None = None,
+    classification_weights: ClassificationWeights | None = None,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     training = optimizer is not None
     model.train(training)
@@ -190,19 +228,81 @@ def run_epoch(
             with torch.autocast(
                 device_type=device.type, dtype=torch.float16, enabled=use_amp
             ):
-                predictions = model(images, view_mask)
-                element_loss = F.huber_loss(
-                    predictions, normalized_targets, delta=1.0, reduction="none"
+                outputs = model(images, view_mask)
+                target_losses: list[torch.Tensor] = []
+                batch_predictions: list[torch.Tensor] = []
+                regression_sample_weights = (
+                    grade_weights.for_targets(targets)
+                    if grade_weights is not None
+                    else None
                 )
-                if grade_weights is None:
-                    per_target_loss = element_loss.mean(dim=0)
-                else:
-                    sample_weights = grade_weights.for_targets(targets)
-                    per_target_loss = (
-                        (element_loss * sample_weights).sum(dim=0)
-                        / sample_weights.sum(dim=0).clamp_min(1e-8)
-                    )
-                loss = per_target_loss.mean()
+                for target_index, spec in enumerate(specs):
+                    output = outputs[spec.column]
+                    if spec.kind == "continuous":
+                        prediction = output.squeeze(1)
+                        target_loss = F.huber_loss(
+                            prediction,
+                            normalized_targets[:, target_index],
+                            delta=1.0,
+                        )
+                    elif grade_objective == "regression":
+                        prediction = output.squeeze(1)
+                        element_loss = F.huber_loss(
+                            prediction,
+                            normalized_targets[:, target_index],
+                            delta=1.0,
+                            reduction="none",
+                        )
+                        if regression_sample_weights is None:
+                            target_loss = element_loss.mean()
+                        else:
+                            weights = regression_sample_weights[:, target_index]
+                            target_loss = (
+                                (element_loss * weights).sum()
+                                / weights.sum().clamp_min(1e-8)
+                            )
+                    elif grade_objective == "softmax":
+                        minimum = int(spec.minimum or 0)
+                        labels = torch.round(targets[:, target_index]).long() - minimum
+                        class_weight = (
+                            classification_weights.class_weights(
+                                spec.column, device
+                            )
+                            if classification_weights is not None
+                            else None
+                        )
+                        target_loss = F.cross_entropy(
+                            output, labels, weight=class_weight
+                        )
+                        prediction = output.argmax(dim=1).to(targets.dtype) + minimum
+                    else:
+                        minimum = int(spec.minimum or 0)
+                        labels = torch.round(targets[:, target_index]).long() - minimum
+                        thresholds = torch.arange(
+                            output.shape[1], device=device
+                        ).unsqueeze(0)
+                        ordinal_targets = (labels.unsqueeze(1) > thresholds).to(
+                            output.dtype
+                        )
+                        positive_weight = (
+                            classification_weights.ordinal_positive_weights(
+                                spec.column, device
+                            )
+                            if classification_weights is not None
+                            else None
+                        )
+                        target_loss = F.binary_cross_entropy_with_logits(
+                            output,
+                            ordinal_targets,
+                            pos_weight=positive_weight,
+                        )
+                        prediction = (
+                            (torch.sigmoid(output) >= 0.5).sum(dim=1).to(targets.dtype)
+                            + minimum
+                        )
+                    target_losses.append(target_loss)
+                    batch_predictions.append(prediction)
+                loss = torch.stack(target_losses).mean()
             if training:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -210,7 +310,9 @@ def run_epoch(
 
         total_loss += loss.item() * len(targets)
         raw_targets.append(targets.detach().cpu().numpy())
-        normalized_predictions.append(predictions.detach().cpu().numpy())
+        normalized_predictions.append(
+            torch.stack(batch_predictions, dim=1).detach().cpu().numpy()
+        )
 
     targets_array = np.concatenate(raw_targets, axis=0)
     predictions_array = normalizer.denormalize_array(
@@ -277,7 +379,7 @@ def target_metrics(
             np.mean(grade_balanced_accuracies)
         )
         summary["grade_macro_within_one"] = float(np.mean(grade_within_one))
-        summary["grade_macro_qwk"] = float(np.mean(grade_qwks))
+        summary["grade_macro_qwk"] = float(np.nanmean(grade_qwks))
     if continuous_nmaes:
         summary["continuous_macro_normalized_mae"] = float(
             np.nanmean(continuous_nmaes)
@@ -313,6 +415,7 @@ def main() -> None:
         required_regions=regions,
         margin_ratio=args.margin_ratio,
         overwrite=args.overwrite_cache,
+        view_policy=args.view_policy,
     )
     if args.cache_only:
         print("Crop cache is ready; exiting because --cache-only was set.")
@@ -327,6 +430,7 @@ def main() -> None:
         available_crops,
         batch_size,
         args.num_workers,
+        args.view_policy,
     )
     train_df = subjects[subjects["split"] == "train"]
     normalizer = TargetNormalizer(specs, train_df)
@@ -336,11 +440,28 @@ def main() -> None:
         power=args.grade_balance_power,
         max_weight=args.max_grade_weight,
     )
-    print(
-        "Grade balancing: "
-        f"power={args.grade_balance_power:g}, "
-        f"max_weight={args.max_grade_weight:g}"
+    classification_weights = ClassificationWeights(
+        specs,
+        train_df,
+        beta=args.class_balance_beta,
+        max_weight=args.max_class_weight,
     )
+    print(
+        f"Configuration: objective={args.grade_objective}, "
+        f"fusion={args.fusion}, view_policy={args.view_policy}"
+    )
+    if args.grade_objective == "regression":
+        print(
+            "Grade balancing: "
+            f"power={args.grade_balance_power:g}, "
+            f"max_weight={args.max_grade_weight:g}"
+        )
+    else:
+        print(
+            "Class balancing: "
+            f"beta={args.class_balance_beta:g}, "
+            f"max_weight={args.max_class_weight:g}"
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
@@ -348,8 +469,12 @@ def main() -> None:
     else:
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    model = MultiRegionMultiViewModel(
-        regions, specs, pretrained=not args.no_pretrained
+    model = ConfigurableSkinModel(
+        regions,
+        specs,
+        grade_objective=args.grade_objective,
+        fusion=args.fusion,
+        pretrained=not args.no_pretrained,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
@@ -363,7 +488,9 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = run_dir / "best.pt"
     history: list[dict[str, float | int]] = []
-    best_val_loss = float("inf")
+    best_selection_value = (
+        float("inf") if args.selection_metric == "loss" else float("-inf")
+    )
     epochs_without_improvement = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -374,7 +501,10 @@ def main() -> None:
             device,
             optimizer,
             scaler,
-            grade_weights,
+            specs,
+            args.grade_objective,
+            grade_weights if args.grade_objective == "regression" else None,
+            classification_weights if args.grade_objective != "regression" else None,
         )
         val_loss, val_targets, val_predictions = run_epoch(
             model,
@@ -383,7 +513,10 @@ def main() -> None:
             device,
             None,
             scaler,
-            grade_weights,
+            specs,
+            args.grade_objective,
+            grade_weights if args.grade_objective == "regression" else None,
+            classification_weights if args.grade_objective != "regression" else None,
         )
         _, train_summary = target_metrics(specs, train_targets, train_predictions)
         _, val_summary = target_metrics(specs, val_targets, val_predictions)
@@ -405,8 +538,20 @@ def main() -> None:
             f"val_loss={val_loss:.4f} {metrics_text}"
         )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        selection_value = {
+            "loss": val_loss,
+            "grade_qwk": val_summary.get("grade_macro_qwk", float("-inf")),
+            "balanced_accuracy": val_summary.get(
+                "grade_macro_balanced_accuracy", float("-inf")
+            ),
+        }[args.selection_metric]
+        improved = (
+            selection_value < best_selection_value
+            if args.selection_metric == "loss"
+            else selection_value > best_selection_value
+        )
+        if improved:
+            best_selection_value = selection_value
             epochs_without_improvement = 0
             torch.save(
                 {
@@ -416,12 +561,21 @@ def main() -> None:
                     "target_specs": [asdict(spec) for spec in specs],
                     "normalizer": normalizer.state_dict(),
                     "grade_weights": grade_weights.state_dict(),
+                    "classification_weights": classification_weights.state_dict(),
+                    "grade_objective": args.grade_objective,
+                    "fusion": args.fusion,
+                    "view_policy": args.view_policy,
+                    "selection_metric": args.selection_metric,
+                    "selection_value": selection_value,
                     "epoch": epoch,
-                    "best_val_loss": best_val_loss,
+                    "best_val_loss": val_loss,
                 },
                 checkpoint_path,
             )
-            print(f"  -> saved {checkpoint_path}")
+            print(
+                f"  -> saved {checkpoint_path} "
+                f"({args.selection_metric}={selection_value:.4f})"
+            )
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= args.patience:
@@ -432,7 +586,14 @@ def main() -> None:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     test_loss, test_targets, test_predictions = run_epoch(
-        model, loaders["test"], normalizer, device, None, scaler
+        model,
+        loaders["test"],
+        normalizer,
+        device,
+        None,
+        scaler,
+        specs,
+        args.grade_objective,
     )
     metric_rows, test_summary = target_metrics(specs, test_targets, test_predictions)
     pd.DataFrame(metric_rows).to_csv(run_dir / "test_metrics.csv", index=False)
@@ -448,6 +609,11 @@ def main() -> None:
         "best_epoch": checkpoint["epoch"],
         "best_val_loss": checkpoint["best_val_loss"],
         "test_loss": test_loss,
+        "grade_objective": args.grade_objective,
+        "fusion": args.fusion,
+        "view_policy": args.view_policy,
+        "selection_metric": checkpoint["selection_metric"],
+        "selection_value": checkpoint["selection_value"],
         **test_summary,
     }
     (run_dir / "summary.json").write_text(

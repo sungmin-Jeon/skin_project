@@ -17,8 +17,13 @@ dependencies = [
   "tqdm>=4.66",
 ]
 
+[project.optional-dependencies]
+landmark = ["mediapipe>=0.10"]
+report = ["matplotlib>=3.8", "seaborn>=0.13"]
+
 [project.scripts]
 skin-train = "skin_project.train:main"
+skin-landmark-manifest = "skin_project.landmarks:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
